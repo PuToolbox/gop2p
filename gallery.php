@@ -96,6 +96,7 @@ cleanExpiredFiles();
 // Handle file upload (server fallback)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
     $file = $_FILES['file'];
+    $peerId = $_POST['peerId'] ?? null; // Get peerId from form data
     if ($file['error'] === UPLOAD_ERR_OK) {
         if ($file['size'] > MAX_FILE_SIZE) {
             $error = 'File size exceeds 10MB limit.';
@@ -122,13 +123,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file'])) {
                             'name' => $file['name'],
                             'type' => $file['type'],
                             'time' => time(),
-                            'peerId' => null,
-                            'key_id' => base64_encode($encryption_key) // Store key ID for tracking
+                            'peerId' => $peerId, // Set peerId directly
+                            'key_id' => base64_encode($encryption_key)
                         ];
                         if (!file_put_contents(METADATA_FILE, json_encode($metadata, JSON_PRETTY_PRINT), LOCK_EX)) {
                             $error = 'Failed to update metadata.';
                         } else {
-                            $success = 'File uploaded successfully.';
+                            header('Content-Type: application/json');
+                            echo json_encode(['success' => true, 'filename' => $filename]);
+                            exit; // Return filename to client
                         }
                     }
                 }
@@ -151,7 +154,6 @@ if (isset($_GET['download'])) {
             $iv = substr($content, 0, $iv_length);
             $encrypted = substr($content, $iv_length);
             
-            // Try current and previous keys
             $keys = loadKeys();
             $decrypted = false;
             foreach ([$keys['current'], $keys['previous']] as $key_info) {
@@ -197,9 +199,10 @@ $nonce = base64_encode(openssl_random_pseudo_bytes(16));
     <meta http-equiv="Referrer-Policy" content="strict-origin-when-cross-origin">
     <meta http-equiv="Strict-Transport-Security" content="max-age=31536000;">
     <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self' 'nonce-<?php echo $nonce; ?>'; style-src 'self'; font-src 'self'; img-src 'self';">
+        content="default-src 'self'; script-src 'self' 'nonce-<?php echo $nonce; ?>' https://unpkg.com; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self' ws: wss:;">
     <title>P2P File Transfer Gallery</title>
     <link rel="stylesheet" href="style-8.css">
+    <script src="https://unpkg.com/simple-peer@9.11.0/simplepeer.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -212,6 +215,7 @@ $nonce = base64_encode(openssl_random_pseudo_bytes(16));
             <?php endif; ?>
 
             <form class="chat-form" id="uploadForm" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="peerId" id="peerId">
                 <div class="form-group">
                     <input type="file" name="file" id="file" accept="image/jpeg,image/png,image/gif,application/pdf" required>
                 </div>
@@ -231,10 +235,10 @@ $nonce = base64_encode(openssl_random_pseudo_bytes(16));
                     $now = time();
                     foreach ($metadata as $filename => $file_info) {
                         if ($now - $file_info['time'] <= EXPIRY_TIME) {
-                            echo '<div class="message">';
+                            echo '<div class="message" data-mime-type="' . htmlspecialchars($file_info['type']) . '">';
                             echo '<span class="message-name">' . htmlspecialchars($file_info['name']) . '</span>';
                             echo '<span class="message-text">';
-                            echo '<a href="?download=' . urlencode($filename) . '" class="open-btn" data-filename="' . urlencode($filename) . '" data-peer-id="' . htmlspecialchars($file_info['peerId'] ?? '') . '">Download</a>';
+                            echo '<a href="?download=' . urlencode($filename) . '" class="open-btn" data-filename="' . urlencode($filename) . '" data-peer-id="' . htmlspecialchars($file_info['peerId'] ?? '') . '" data-mime-type="' . htmlspecialchars($file_info['type']) . '">Download</a>';
                             echo ' (Expires in ' . (EXPIRY_TIME - ($now - $file_info['time'])) . ' seconds)';
                             echo '</span>';
                             echo '</div>';
@@ -252,6 +256,6 @@ $nonce = base64_encode(openssl_random_pseudo_bytes(16));
         </div>
     </div>
 
-    <script nonce="<?php echo $nonce; ?>" src="gop2p.js"></script>
+    <script nonce="<?php echo $nonce; ?>" src="gop2p.js" data-expiry-time="<?php echo EXPIRY_TIME * 1000; ?>" data-max-file-size="<?php echo MAX_FILE_SIZE; ?>"></script>
 </body>
 </html>
