@@ -3,14 +3,135 @@ const files = new Map();
 const EXPIRY_TIME = Number(document.querySelector('script[data-expiry-time]').dataset.expiryTime);
 const MAX_FILE_SIZE = Number(document.querySelector('script[data-max-file-size]').dataset.maxFileSize);
 
+// Fetch file list from server
+async function fetchFileList() {
+    try {
+        const response = await fetch('gallery/files.json');
+        if (!response.ok) {
+            console.error(`Failed to fetch files.json: ${response.status}`);
+            return;
+        }
+        const metadata = await response.json();
+        console.log('Fetched files.json:', metadata);
+        const now = Math.floor(Date.now() / 1000);
+        const fileList = Object.entries(metadata).map(([filename, info]) => ({
+            filename,
+            name: info.name,
+            type: info.type,
+            peerId: info.peerId || '',
+            expires_in: 300 - (now - info.time)
+        })).filter(f => f.expires_in > 0);
+        updateFileList(fileList);
+    } catch (err) {
+        console.error('fetchFileList error:', err);
+    }
+}
+
+// Update file list dynamically without flickering
+function updateFileList(files) {
+    const fileList = document.getElementById('fileList');
+    const existingFiles = new Map(
+        Array.from(fileList.querySelectorAll('.message[data-filename]')).map(el => [
+            el.dataset.filename,
+            el
+        ])
+    );
+
+    // Handle empty file list
+    if (!files || files.length === 0) {
+        if (existingFiles.size > 0) {
+            fileList.innerHTML = '<div class="message">No files available.</div>';
+            console.log('Cleared file list: no files available');
+        }
+        return;
+    }
+
+    // Remove "No files available" message if present
+    const noFilesMessage = fileList.querySelector('.message:not([data-filename])');
+    if (noFilesMessage) {
+        noFilesMessage.remove();
+        console.log('Removed no files message');
+    }
+
+    // Add or update files
+    files.forEach(file => {
+        if (existingFiles.has(file.filename)) {
+            // Update expiration time
+            const el = existingFiles.get(file.filename);
+            const expiresSpan = el.querySelector('.message-text').lastChild;
+            expiresSpan.textContent = ` (Expires in ${file.expires_in} seconds)`;
+            existingFiles.delete(file.filename);
+            console.log(`Updated expiration for: ${file.filename}`);
+        } else {
+            // Add new file
+            const div = document.createElement('div');
+            div.className = 'message';
+            div.dataset.filename = file.filename;
+            div.innerHTML = `
+                <span class="message-name">${file.name}</span>
+                <span class="message-text">
+                    <a href="?download=${encodeURIComponent(file.filename)}" 
+                       class="open-btn" 
+                       data-filename="${encodeURIComponent(file.filename)}" 
+                       data-peer-id="${file.peerId}" 
+                       data-mime-type="${file.type}">Download</a>
+                    (Expires in ${file.expires_in} seconds)
+                </span>
+            `;
+            fileList.prepend(div);
+            div.querySelector('.open-btn').addEventListener('click', handleDownload);
+            console.log(`Added new file: ${file.filename}`);
+        }
+    });
+
+    // Remove files that no longer exist
+    existingFiles.forEach(el => {
+        el.remove();
+        console.log(`Removed old file: ${el.dataset.filename}`);
+    });
+}
+
+// Update expiration countdowns client-side
+function updateExpirationCountdown() {
+    const fileList = document.getElementById('fileList');
+    fileList.querySelectorAll('.message[data-filename]').forEach(el => {
+        const expiresSpan = el.querySelector('.message-text').lastChild;
+        const match = expiresSpan.textContent.match(/\d+/);
+        if (match) {
+            const seconds = parseInt(match[0]) - 1;
+            if (seconds <= 0) {
+                el.remove();
+                console.log(`Removed expired file: ${el.dataset.filename}`);
+            } else {
+                expiresSpan.textContent = ` (Expires in ${seconds} seconds)`;
+            }
+        }
+    });
+}
+
+// Show feedback message
+function showFeedback(message, isError = false) {
+    const feedbackDiv = document.createElement('div');
+    feedbackDiv.className = isError ? 'error' : 'success';
+    feedbackDiv.textContent = message;
+    const contentDiv = document.querySelector('.content');
+    contentDiv.insertBefore(feedbackDiv, contentDiv.firstChild);
+    setTimeout(() => feedbackDiv.remove(), 3000);
+}
+
 // Fetch current encryption key from server
 async function fetchCurrentKey() {
-    const response = await fetch('get_key.php');
-    if (!response.ok) {
-        throw new Error('Failed to fetch encryption key');
+    try {
+        const response = await fetch('get_key.php');
+        if (!response.ok) {
+            throw new Error(`Failed to fetch encryption key: ${response.status}`);
+        }
+        const keyData = await response.json();
+        return keyData.current_key;
+    } catch (err) {
+        console.error('fetchCurrentKey error:', err);
+        throw err;
     }
-    const keyData = await response.json();
-    return keyData.current_key;
 }
 
 // Decode base64 key and validate length
@@ -26,6 +147,7 @@ async function decodeKey(base64Key) {
         }
         return keyData;
     } catch (err) {
+        console.error('decodeKey error:', err);
         throw new Error('Failed to decode encryption key: ' + err.message);
     }
 }
@@ -50,7 +172,7 @@ async function encryptFile(file) {
         );
         return { iv: Array.from(iv), data: Array.from(new Uint8Array(encrypted)), type: file.type, key: base64Key };
     } catch (err) {
-        console.error('Encryption error:', err);
+        console.error('encryptFile error:', err);
         throw err;
     }
 }
@@ -59,6 +181,9 @@ async function encryptFile(file) {
 async function decryptAndDownload(filename, encrypted, type) {
     try {
         const response = await fetch('get_key.php');
+        if (!response.ok) {
+            throw new Error(`Failed to fetch keys: ${response.status}`);
+        }
         const responseData = await response.json();
         const keys = [responseData.current_key, responseData.previous_key].filter(Boolean);
         
@@ -98,13 +223,183 @@ async function decryptAndDownload(filename, encrypted, type) {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
     } catch (err) {
-        console.error('Decryption error:', err);
-        alert('Failed to decrypt file: ' + err.message);
+        console.error('decryptAndDownload error:', err);
+        showFeedback('Failed to decrypt file: ' + err.message, true);
+    }
+}
+
+// P2P download function
+async function downloadFromPeer(peerIdRequested, filename, type) {
+    return new Promise((resolve, reject) => {
+        const peer = new SimplePeer({ initiator: true });
+        const timeout = setTimeout(() => {
+            peer.destroy();
+            reject(new Error('WebRTC connection timed out after 10 seconds'));
+        }, 10000);
+
+        peer.on('error', (err) => {
+            clearTimeout(timeout);
+            console.error('WebRTC peer error:', err);
+            reject(err);
+        });
+
+        peer.on('signal', async (signalData) => {
+            try {
+                console.log('Sending signaling data for peer:', peerIdRequested);
+                const response = await fetch('signal.php', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ peerId: peerIdRequested, signalData })
+                });
+                if (!response.ok) {
+                    throw new Error(`Failed to send signaling data: ${response.status}`);
+                }
+                const { peerSignalData } = await response.json();
+                if (peerSignalData) {
+                    console.log('Received peer signaling data:', peerSignalData);
+                    peer.signal(peerSignalData);
+                }
+            } catch (err) {
+                clearTimeout(timeout);
+                console.error('Signaling error:', err);
+                reject(err);
+            }
+        });
+
+        peer.on('connect', () => {
+            clearTimeout(timeout);
+            console.log('WebRTC connection established with peer:', peerIdRequested);
+            peer.send(JSON.stringify({ filename }));
+        });
+
+        peer.on('data', (data) => {
+            try {
+                console.log('Received data from peer for:', filename);
+                const encrypted = JSON.parse(data);
+                decryptAndDownload(filename, encrypted, type);
+                resolve();
+            } catch (err) {
+                console.error('Data processing error:', err);
+                reject(err);
+            }
+        });
+    });
+}
+
+// Handle uploader's signaling
+function setupPeerServer() {
+    const peer = new SimplePeer();
+    peer.on('error', (err) => console.error('WebRTC peer error:', err));
+
+    peer.on('signal', async (signalData) => {
+        try {
+            console.log('Uploader sending signaling data for peerId:', peerId);
+            await fetch('signal.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ peerId, signalData })
+            });
+        } catch (err) {
+            console.error('Failed to send uploader signaling data:', err);
+        }
+    });
+
+    peer.on('connect', () => {
+        console.log('WebRTC connection established as uploader');
+    });
+
+    peer.on('data', (data) => {
+        try {
+            const { filename } = JSON.parse(data);
+            console.log('Uploader received request for:', filename);
+            const originalFilename = Array.from(files.keys()).find(name => 
+                files.get(name).serverFilename === filename
+            );
+            if (originalFilename && files.has(originalFilename)) {
+                const fileData = files.get(originalFilename);
+                peer.send(JSON.stringify(fileData.encrypted));
+                console.log('Sent file to peer:', filename);
+            } else {
+                console.error('File not found in client:', filename, 'Available:', Array.from(files.keys()));
+            }
+        } catch (err) {
+            console.error('Failed to send file data:', err);
+        }
+    });
+
+    setInterval(async () => {
+        try {
+            const response = await fetch(`signal.php?peerId=${peerId}`);
+            if (response.ok) {
+                const signalData = await response.json();
+                if (signalData) {
+                    console.log('Uploader received signaling data:', signalData);
+                    peer.signal(signalData);
+                }
+            }
+        } catch (err) {
+            console.error('Failed to fetch signaling data:', err);
+        }
+    }, 1000);
+}
+
+// Handle file download
+function handleDownload(e) {
+    e.preventDefault();
+    const button = e.target;
+    const filename = button.dataset.filename;
+    const peerIdRequested = button.dataset.peerId;
+    const mimeType = button.dataset.mimeType || 'application/octet-stream';
+
+    console.log('Download initiated for:', filename, 'Peer ID:', peerIdRequested);
+
+    if (peerIdRequested && peerIdRequested !== peerId) {
+        console.log('Attempting P2P download from peer:', peerIdRequested);
+        downloadFromPeer(peerIdRequested, filename, mimeType)
+            .then(() => console.log('P2P download succeeded'))
+            .catch(err => {
+                console.error('P2P download failed:', err);
+                console.log('Falling back to server download for:', filename);
+                serverDownload(filename, button);
+            });
+    } else {
+        console.log('Falling back to server download for:', filename);
+        serverDownload(filename, button);
+    }
+}
+
+// Server download fallback
+async function serverDownload(filename, button) {
+    try {
+        const response = await fetch(`?download=${filename}`);
+        if (!response.ok) {
+            throw new Error(`Server download failed: ${response.status}`);
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = button.closest('.message').querySelector('.message-name').textContent;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        console.error('Server download error:', err);
+        showFeedback('Download failed: ' + err.message, true);
     }
 }
 
 // Wait for DOM to be ready
 document.addEventListener('DOMContentLoaded', function() {
+    setupPeerServer();
+
+    // Set peerId in form
+    const peerIdInput = document.getElementById('peerId');
+    if (peerIdInput) {
+        peerIdInput.value = peerId;
+    }
+
     // Handle file upload
     const uploadForm = document.getElementById('uploadForm');
     if (uploadForm) {
@@ -113,77 +408,78 @@ document.addEventListener('DOMContentLoaded', function() {
             const fileInput = document.getElementById('file');
             const file = fileInput.files[0];
             if (!file) {
-                alert('No file selected.');
+                showFeedback('No file selected.', true);
                 return;
             }
 
             if (file.size > MAX_FILE_SIZE) {
-                alert('File size exceeds 10MB limit.');
+                showFeedback('File size exceeds 10MB limit.', true);
                 return;
             }
 
             const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf'];
             if (!allowedTypes.includes(file.type)) {
-                alert('Invalid file type. Allowed: JPEG, PNG, GIF, PDF.');
+                showFeedback('Invalid file type. Allowed: JPEG, PNG, GIF, PDF.', true);
                 return;
             }
 
             try {
                 // Encrypt and store client-side
                 const encrypted = await encryptFile(file);
-                files.set(file.name, { encrypted, time: Date.now() });
+                files.set(file.name, { encrypted, time: Date.now(), serverFilename: null });
                 console.log('File stored client-side:', file.name);
 
-                // Upload to server for metadata and fallback
-                const formData = new FormData();
-                formData.append('file', file);
+                // Upload to server
+                const formData = new FormData(uploadForm);
                 const response = await fetch('', {
                     method: 'POST',
                     body: formData
                 });
-                if (response.ok) {
-                    // Update peerId in metadata
-                    const filename = file.name.replace(/\.[^/.]+$/, '') + '.enc';
-                    const metadataResponse = await fetch('update_metadata.php', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ filename, peerId })
+                const responseData = await response.json();
+                if (response.ok && responseData.success) {
+                    console.log('File uploaded, server filename:', responseData.filename);
+                    files.set(file.name, { 
+                        encrypted, 
+                        time: Date.now(), 
+                        serverFilename: responseData.filename 
                     });
-                    if (metadataResponse.ok) {
-                        console.log('Metadata updated with peerId:', peerId);
-                        location.reload();
-                    } else {
-                        console.error('Metadata update failed:', await metadataResponse.text());
-                        alert('Failed to update metadata.');
-                    }
+                    fetchFileList(); // Update file list after upload
+                    showFeedback(`File uploaded successfully: ${file.name}`);
+                    fileInput.value = '';
                 } else {
-                    console.error('Server upload failed:', await response.text());
-                    alert('Server upload failed.');
+                    console.error('Server upload failed:', responseData.error || await response.text());
+                    showFeedback('Server upload failed: ' + (responseData.error || 'Unknown error'), true);
                 }
             } catch (err) {
                 console.error('Upload error:', err);
-                alert('Upload failed: ' + err.message);
+                showFeedback('Upload failed: ' + err.message, true);
             }
         });
     }
 
     // Handle file download
     document.querySelectorAll('.open-btn').forEach(button => {
-        button.addEventListener('click', async (e) => {
-            e.preventDefault();
-            const filename = button.dataset.filename;
-            const peerIdRequested = button.dataset.peerId;
-
-            if (peerIdRequested === peerId && files.has(filename.replace('.enc', ''))) {
-                console.log('Serving file from client:', filename);
-                const fileData = files.get(filename.replace('.enc', ''));
-                await decryptAndDownload(filename, fileData.encrypted, fileData.encrypted.type);
-            } else {
-                console.log('Falling back to server download for:', filename);
-                window.location.href = `?download=${filename}`;
-            }
-        });
+        button.addEventListener('click', handleDownload);
     });
+
+    // Start polling for file list updates
+    fetchFileList(); // Initial fetch
+    let pollInterval = setInterval(fetchFileList, 3000); // Poll every 3 seconds
+
+    // Pause polling when tab is inactive
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            clearInterval(pollInterval);
+            console.log('Paused polling: tab inactive');
+        } else {
+            pollInterval = setInterval(fetchFileList, 3000);
+            fetchFileList();
+            console.log('Resumed polling: tab active');
+        }
+    });
+
+    // Start expiration countdown
+    setInterval(updateExpirationCountdown, 1000); // Update every second
 });
 
 // Clean up expired files client-side
